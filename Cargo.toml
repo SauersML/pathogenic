@@ -14,3 +14,13 @@ csv = "1.3"
 rayon = "1.10"
 # For .gz
 flate2 = "1.1.0"
+# Noodles for VCF parsing/handling - use the meta crate
+noodles = { version = "0.95.0", features = ["vcf", "csi", "core"] }
+# Date/time handling for logging
+chrono = "0.4"
+# Progress bars
+indicatif = "0.17"
+# CPU count for parallel processing
+num_cpus = "1.16"
+# XZ compression support
+xz2 = "0.1"

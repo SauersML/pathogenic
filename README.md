@@ -8,7 +8,7 @@ This tool analyzes VCF (Variant Call Format) files to identify potentially patho
 
 ## Features
 
-- **Comprehensive Pathogenic Variant Detection**: Identifies variants classified as pathogenic or likely pathogenic in ClinVar
+- **Comprehensive Variant Detection**: Identifies variants classified as pathogenic, benign, or of uncertain significance in ClinVar
 - **Population Frequency Integration**: Incorporates allele frequencies from 1000 Genomes (global and by population)
 - **High Performance**:
   - Parallel processing using Rayon's work-stealing thread pool
@@ -21,10 +21,36 @@ This tool analyzes VCF (Variant Call Format) files to identify potentially patho
   - Mode of inheritance if available
   - Citations and additional evidence
 - **Automatic Reference Data Management**: Downloads and maintains necessary reference databases
+- **Advanced Reporting**: Generates detailed CSV reports and summary statistics files
+- **Flexible Variant Selection**: Configurable inclusion of pathogenic, VUS, and benign variants
 
 ## Installation
 
+There are multiple ways to install the Pathogenic Variant Finder:
+
+### Option 1: Using the installer script (recommended)
+
+```bash
+# Clone the repository
+git clone https://github.com/SauersML/pathogenic.git
+cd pathogenic
+
+# Run the installer script (you might need to make it executable first)
+chmod +x install.sh
+./install.sh
+
+# Or run it directly with bash
+bash install.sh
 ```
+
+The installer will:
+1. Build the release version of the tool
+2. Give you options to create a symlink in a directory in your PATH
+3. Allow you to run the tool simply as `pathogenic` from anywhere
+
+### Option 2: Manual installation
+
+```bash
 # Clone the repository
 git clone https://github.com/SauersML/pathogenic.git
 cd pathogenic
@@ -32,28 +58,59 @@ cd pathogenic
 # Build the project
 cargo build --release
 
-# The binary will be available at target/release/pathogenic
+# The binary will be available at target/release/pathogenic_variant_finder
+# You can run it directly:
+./target/release/pathogenic_variant_finder -b GRCh38 -i your_variants.vcf
+
+# Optional: Create a symlink for easier access
+sudo ln -sf "$(pwd)/target/release/pathogenic_variant_finder" /usr/local/bin/pathogenic
 ```
+
+### Development Container Users
+
+If you're using the provided Dev Container, the tool will be automatically built and made available as `pathogenic` in your PATH when the container starts.
 
 ## Usage
 
-```
-# Basic usage
-pathogenic --build GRCh38 --input your_variants.vcf > results.csv
+Once installed, you can use the tool simply as:
+
+```bash
+# Basic usage (pathogenic variants only)
+pathogenic -b GRCh38 -i your_variants.vcf
+
+# Include Variants of Uncertain Significance (VUS)
+pathogenic -b GRCh38 -i your_variants.vcf -v
+
+# Include benign variants
+pathogenic -b GRCh38 -i your_variants.vcf -n
+
+# Include both VUS and benign variants
+pathogenic -b GRCh38 -i your_variants.vcf -v -n
+
+# Disable markdown report generation
+pathogenic -b GRCh38 -i your_variants.vcf --markdown-report=false
 ```
 
 ### Command-line Arguments
 
 - `--build`, `-b`: Genome build, must be either "GRCh37" (hg19) or "GRCh38" (hg38)
 - `--input`, `-i`: Path to the input VCF file (can be uncompressed or gzipped)
+- `--include-vus`, `-v`, `--vus`: Include variants of uncertain significance in the output
+- `--include-benign`, `-n`, `--benign`: Include benign variants in the output
+- `--markdown-report`, `--md-report`: Generate markdown report (enabled by default, use `--markdown-report=false` to disable)
 
 ## Output
 
-The tool outputs a CSV file to stdout with the following columns:
+The tool generates the following output files in the `reports/` directory:
+
+### 1. CSV Report File
+
+The CSV report contains detailed information about all identified variants with the following columns:
 
 - Chromosome, Position, Reference Allele, Alternate Allele
 - Clinical Significance
 - Is Alt Pathogenic
+- Significance Category (pathogenic, benign, vus, conflicting)
 - Gene
 - ClinVar Allele ID
 - Clinical Disease Name (CLNDN)
@@ -74,6 +131,46 @@ The tool outputs a CSV file to stdout with the following columns:
  
 Depending on available data, many of these fields may not be available.
 
+### 2. Statistics Text File
+
+A companion statistics file summarizing the analysis settings and results:
+
+- Analysis settings (input file, genome build, variant types included)
+- Command used to run the analysis
+- Total variants processed and reported
+- Number of unique genes
+- Counts of each variant classification type
+- Distribution of allele frequencies across populations
+
+### 3. Markdown Report File
+
+A comprehensive, human-readable markdown report that includes:
+
+- Analysis settings and command used
+- Summary statistics with variant counts by category
+- Table of contents linking to different sections
+- Detailed variant information organized by clinical significance
+- Variants grouped by gene with sortable tables
+- Detailed information about each variant including:
+  - Location, DNA change, and genotype
+  - Clinical significance and disease associations
+  - Population frequencies
+  - Mode of inheritance and other annotations
+- Understanding section with explanations of terms
+
+The markdown report is generated by default but can be disabled using `--markdown-report=false`.
+
+### Output File Naming
+
+Output files follow this naming convention:
+```
+[input_filename]_[analysis_type]_[timestamp].csv
+[input_filename]_[analysis_type]_[timestamp]_stats.txt
+[input_filename]_[analysis_type]_[timestamp].md
+```
+
+Where `analysis_type` indicates which variant types were included in the report.
+
 ## How It Works
 
 1. **Data Collection**: The tool automatically downloads necessary reference databases:
@@ -84,17 +181,29 @@ Depending on available data, many of these fields may not be available.
 2. **Variant Processing**:
    - Parses the user's VCF input
    - Filters for variants present in the sample's genotype
-   - Matches variants against ClinVar to identify pathogenic variants
+   - Matches variants against ClinVar based on selected variant types
    - Integrates 1000 Genomes allele frequency data
    - Adds detailed annotations from ClinVar summary data
 
 3. **Output Generation**:
    - Sorts variants by chromosome and position
    - Outputs comprehensive CSV with all annotations
+   - Generates a statistics file summarizing the analysis
+   - Creates a detailed markdown report with interactive sections (unless disabled)
 
 ## Logging
 
 The tool maintains a log file (`pathogenic.log`) that captures all processing steps and can be useful for troubleshooting.
+
+## Documentation
+
+For more detailed information, see the documentation in the `docs/` directory:
+
+- [Implementation Details](docs/implementation_details.md)
+- [Noodles Integration](docs/noodles_integration.md)
+- [Parallel Processing](docs/parallel_processing.md)
+- [Reporting Features](docs/reporting_features.md)
+- [1000 Genome Frequency Extraction](docs/1000genome_frequency_extraction.md)
 
 ## Usage
 Do not use this for clinical purposes.
