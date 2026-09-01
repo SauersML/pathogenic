@@ -1,0 +1,24 @@
+name: PR 1 audit
+
+on:
+  push:
+    branches: [codex/pr-1-audit]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Formatting
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Compile all targets
+        run: cargo check --all-targets
+      - name: Test all targets
+        run: cargo test --all-targets
