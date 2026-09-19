@@ -17,5 +17,5 @@ target/
 reports/
 data/
 clinvar_data/
-Cargo.lock
 .cursorrules
+.DS_Store

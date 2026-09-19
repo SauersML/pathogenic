@@ -166,7 +166,7 @@ Output files follow this naming convention:
 ```
 [input_filename]_[analysis_type]_[timestamp].csv
 [input_filename]_[analysis_type]_[timestamp]_stats.txt
-[input_filename]_[analysis_type]_[timestamp].md
+[input_filename]_[analysis_type]_[timestamp]_report.md
 ```
 
 Where `analysis_type` indicates which variant types were included in the report.

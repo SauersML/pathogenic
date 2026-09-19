@@ -17,18 +17,18 @@ All files are automatically generated in the `reports/` directory upon completio
 The output files follow a specific naming convention to help with organization and identification:
 
 ```
-[input_filename]_[analysis_type]_[timestamp].(csv|txt|md)
+[input_filename]_[analysis_type]_[timestamp](.csv|_stats.txt|_report.md)
 ```
 
 Where:
 - `input_filename`: The base name of the input VCF file (without extension)
 - `analysis_type`: Indicates the types of variants included in the analysis
-  - `pathogenic`: Only pathogenic variants
+  - `pathogenic_only`: Only pathogenic variants
   - `pathogenic_vus`: Pathogenic and variants of uncertain significance
   - `pathogenic_benign`: Pathogenic and benign variants
   - `pathogenic_vus_benign`: All variant types
 - `timestamp`: Date and time of the analysis in format `YYYYMMDD_HHMMSS`
-- File extensions: `.csv` for the variant report, `_stats.txt` for the statistics file, and `.md` for the markdown report
+- File extensions: `.csv` for the variant report, `_stats.txt` for the statistics file, and `_report.md` for the markdown report
 
 ## CSV Report Format
 
