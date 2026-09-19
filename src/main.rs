@@ -515,6 +515,13 @@ struct InputVariant {
     genotype: String,
 }
 
+/// The allele indices of a GT call such as "0/1", "1|1", "1/2" or a haploid "1",
+/// with `None` for a missing allele ("."). Phased and unphased calls parse alike:
+/// which alleles a call holds does not depend on its phase.
+fn parse_gt(genotype: &str) -> Vec<Option<usize>> {
+    genotype.split(['/', '|']).map(|allele| allele.parse::<usize>().ok()).collect()
+}
+
 /// Attempt to parse a single user line from VCF
 fn parse_input_line(line: &str) -> Option<(String, InputVariant)> {
     if line.starts_with('#') || line.trim().is_empty() {
@@ -572,14 +579,9 @@ fn parse_input_line(line: &str) -> Option<(String, InputVariant)> {
         "1/1".to_string()
     };
 
-    if !genotype.is_empty() {
-        let split_gt: Vec<&str> = genotype.split(&['/', '|'][..]).collect();
-        for g in split_gt {
-            if let Ok(idx) = g.parse::<usize>() {
-                if idx >= 1 {
-                    present_flags.insert(idx);
-                }
-            }
+    for idx in parse_gt(&genotype).into_iter().flatten() {
+        if idx >= 1 {
+            present_flags.insert(idx);
         }
     }
 
@@ -864,6 +866,8 @@ struct FinalRecord {
     gene: Option<String>,
     allele_id: Option<i32>,
     genotype: String,
+    /// 1-based VCF allele index of `alt_allele` in the input record, which `genotype` refers to
+    allele_index: usize,
     review_stars: u8,
     af_esp: Option<f64>,
     af_exac: Option<f64>,
@@ -899,6 +903,51 @@ fn get_chromosome_order(chr: &str) -> usize {
         return num;
     } else {
         return 100; // Any other chromosome types will be sorted last
+    }
+}
+
+/// Zygosity of one ALT allele in a sample's GT call
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zygosity {
+    Homozygous,
+    Heterozygous,
+    Hemizygous,
+    Unknown,
+}
+
+impl Zygosity {
+    /// Count the copies of `allele_index` (the 1-based VCF allele index) in the
+    /// call against the call's ploidy. A call with a missing allele ("1/.")
+    /// cannot say whether the other copy carries the variant, so it is Unknown.
+    fn of(genotype: &str, allele_index: usize) -> Zygosity {
+        let alleles = parse_gt(genotype);
+        let copies = alleles.iter().filter(|&&allele| allele == Some(allele_index)).count();
+        if copies == 0 || alleles.contains(&None) {
+            return Zygosity::Unknown;
+        }
+        match alleles.len() {
+            1 => Zygosity::Hemizygous,
+            ploidy if copies == ploidy => Zygosity::Homozygous,
+            _ => Zygosity::Heterozygous,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Zygosity::Homozygous => "Homozygous",
+            Zygosity::Heterozygous => "Heterozygous",
+            Zygosity::Hemizygous => "Hemizygous",
+            Zygosity::Unknown => "Unknown",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Zygosity::Homozygous => "Homozygous (both copies of the gene have this variant)",
+            Zygosity::Heterozygous => "Heterozygous (one copy of the gene has this variant)",
+            Zygosity::Hemizygous => "Hemizygous (the only copy of the gene has this variant)",
+            Zygosity::Unknown => "Unknown",
+        }
     }
 }
 
@@ -1080,6 +1129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         gene: Option<String>,
         allele_id: Option<i32>,
         genotype: String,
+        allele_index: usize,
         review_stars: u8,
         af_esp: Option<f64>,
         af_exac: Option<f64>,
@@ -1104,7 +1154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .par_iter()
         .flat_map_iter(|(_, iv)| {
             let mut local_found = Vec::new();
-            for (alt_a, is_present) in &iv.alts {
+            for (alt_offset, (alt_a, is_present)) in iv.alts.iter().enumerate() {
                 if !is_present {
                     continue;
                 }
@@ -1124,6 +1174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         gene: cv.gene.clone(),
                         allele_id: cv.allele_id,
                         genotype,
+                        allele_index: alt_offset + 1,
                         review_stars,
                         af_esp: cv.af_esp,
                         af_exac: cv.af_exac,
@@ -1357,6 +1408,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             gene: r.gene.clone(),
             allele_id: r.allele_id,
             genotype: r.genotype.clone(),
+            allele_index: r.allele_index,
             review_stars: r.review_stars,
             af_esp: r.af_esp,
             af_exac: r.af_exac,
@@ -2083,13 +2135,7 @@ fn write_variant_section(
         
         // Determine zygosity from genotype
         let genotype = &variant.genotype;
-        let zygosity = if genotype == "1/1" {
-            "Homozygous"
-        } else if genotype == "0/1" || genotype == "1/0" {
-            "Heterozygous"
-        } else {
-            "Unknown"
-        };
+        let zygosity = Zygosity::of(genotype, variant.allele_index).label();
         
         let genotype_text = format!("{}, {}", genotype, zygosity);
         
@@ -2172,13 +2218,7 @@ fn write_variant_details(
     writeln!(md_file)?;
     
     // Genotype / Zygosity
-    let zygosity = if variant.genotype == "1/1" {
-        "Homozygous (both copies of the gene have this variant)"
-    } else if variant.genotype == "0/1" || variant.genotype == "1/0" {
-        "Heterozygous (one copy of the gene has this variant)"
-    } else {
-        ""
-    };
+    let zygosity = Zygosity::of(&variant.genotype, variant.allele_index).description();
     
     writeln!(
         md_file,
@@ -2419,6 +2459,7 @@ mod tests {
             gene: Some(gene.to_string()),
             allele_id: None,
             genotype: "0/1".to_string(),
+            allele_index: 1,
             review_stars: 1,
             af_esp: None,
             af_exac: None,
@@ -2497,5 +2538,44 @@ mod tests {
         // Each section lists its records once in its table and once in its details.
         let detailed = text.lines().filter(|line| line.starts_with("<a id=\"variant-")).count();
         assert_eq!(detailed, records.len());
+    }
+
+    #[test]
+    fn zygosity_counts_allele_copies_whatever_the_phase() {
+        use Zygosity::*;
+        let cases = [
+            ("0/1", 1, Heterozygous),
+            ("0|1", 1, Heterozygous),
+            ("1|0", 1, Heterozygous),
+            ("1/1", 1, Homozygous),
+            ("1|1", 1, Homozygous),
+            ("1/2", 1, Heterozygous),
+            ("1|2", 2, Heterozygous),
+            ("2/2", 2, Homozygous),
+            ("1", 1, Hemizygous),
+            ("1/.", 1, Unknown),
+            ("0/1", 2, Unknown),
+        ];
+        for (genotype, allele_index, expected) in cases {
+            assert_eq!(Zygosity::of(genotype, allele_index), expected, "{genotype} allele {allele_index}");
+        }
+    }
+
+    #[test]
+    fn phased_and_multiallelic_calls_mark_the_alleles_they_hold() {
+        let (_, variant) = parse_input_line("1\t100\t.\tA\tG,T\t.\tPASS\t.\tGT\t0|2").unwrap();
+        assert_eq!(variant.alts, vec![("G".to_string(), false), ("T".to_string(), true)]);
+    }
+
+    #[test]
+    fn markdown_reports_phased_calls_with_their_zygosity() {
+        let mut het = final_record(1000, "GENEA", Classification::Pathogenic);
+        het.genotype = "0|1".to_string();
+        let mut hom = final_record(2000, "GENEB", Classification::Pathogenic);
+        hom.genotype = "1|1".to_string();
+        let text = markdown_report(&[het, hom], "zygosity");
+        assert!(text.contains("| 0|1, Heterozygous |"), "{text}");
+        assert!(text.contains("| 1|1, Homozygous |"), "{text}");
+        assert!(!text.contains("Unknown |"), "{text}");
     }
 }
