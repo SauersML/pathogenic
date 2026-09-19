@@ -1655,7 +1655,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             &final_records,
             &markdown_path,
             &args,
-            &category_counts,
             &unique_genes,
             &input_path,
             &build,
@@ -1684,7 +1683,6 @@ fn generate_markdown_report(
     final_records: &[FinalRecord],
     out_path: &Path,
     args: &Args,
-    category_counts: &HashMap<String, usize>,
     unique_genes: &HashSet<String>,
     input_path: &Path,
     build: &str,
@@ -1721,37 +1719,48 @@ fn generate_markdown_report(
     // Organize variants by type and gene
     for record in final_records {
         let gene_name = record.gene.clone().unwrap_or_else(|| "Unknown".to_string());
-        let clnsig = &record.clnsig;
-        
-        if record.classification.category() == "pathogenic" {
-            // Split pathogenic variants based on their specific clnsig value
-            if clnsig.contains("Likely_pathogenic") && !clnsig.contains("Pathogenic") {
-                has_likely_pathogenic = true;
-                gene_likely_pathogenic.entry(gene_name).or_default().push(record);
-            } else {
-                // Either strictly Pathogenic or Pathogenic/Likely_pathogenic
+        // The flags already decided which classes were parsed, so every record here
+        // belongs in the section of its classification.
+        match record.classification {
+            Classification::Pathogenic => {
                 has_pathogenic = true;
                 gene_pathogenic.entry(gene_name).or_default().push(record);
             }
-        } else if record.classification.category() == "vus" && args.include_vus {
-            has_vus = true;
-            gene_vus.entry(gene_name).or_default().push(record);
-        } else if record.classification.category() == "benign" && args.include_benign {
-            // Split benign variants based on their specific clnsig value
-            if clnsig.contains("Likely_benign") && !clnsig.contains("Benign") {
-                has_likely_benign = true;
-                gene_likely_benign.entry(gene_name).or_default().push(record);
-            } else {
-                // Either strictly Benign or Benign/Likely_benign
+            Classification::LikelyPathogenic => {
+                has_likely_pathogenic = true;
+                gene_likely_pathogenic.entry(gene_name).or_default().push(record);
+            }
+            Classification::Uncertain => {
+                has_vus = true;
+                gene_vus.entry(gene_name).or_default().push(record);
+            }
+            Classification::Conflicting => {
+                has_conflicting = true;
+                gene_conflicting.entry(gene_name).or_default().push(record);
+            }
+            Classification::Benign => {
                 has_benign = true;
                 gene_benign.entry(gene_name).or_default().push(record);
             }
-        } else if record.classification.category() == "conflicting" && args.include_vus {
-            has_conflicting = true;
-            gene_conflicting.entry(gene_name).or_default().push(record);
+            Classification::LikelyBenign => {
+                has_likely_benign = true;
+                gene_likely_benign.entry(gene_name).or_default().push(record);
+            }
+            Classification::Other => {}
         }
     }
-    
+
+    // The summary table counts the same groups the sections below list, so its
+    // rows always agree with the report body.
+    let section_counts = SectionCounts {
+        pathogenic: variant_count(&gene_pathogenic),
+        likely_pathogenic: variant_count(&gene_likely_pathogenic),
+        vus: variant_count(&gene_vus),
+        conflicting: variant_count(&gene_conflicting),
+        benign: variant_count(&gene_benign),
+        likely_benign: variant_count(&gene_likely_benign),
+    };
+
     // Create a list of sections for Table of Contents and report generation
     struct Section<'a> {
         id: String,
@@ -1910,7 +1919,7 @@ fn generate_markdown_report(
         if section.id == "disclaimer" {
             write_disclaimer_section(&mut md_file)?;
         } else if section.id == "summary" {
-            write_summary_section(&mut md_file, category_counts, args, final_records.len(), total_variants, unique_genes.len())?;
+            write_summary_section(&mut md_file, &section_counts, args, final_records.len(), total_variants, unique_genes.len())?;
         } else if section.id == "understanding-this-report" {
             write_understanding_section(&mut md_file)?;
         } else {
@@ -1937,10 +1946,24 @@ fn write_disclaimer_section(md_file: &mut File) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Number of reported variants in each markdown section
+struct SectionCounts {
+    pathogenic: usize,
+    likely_pathogenic: usize,
+    vus: usize,
+    conflicting: usize,
+    benign: usize,
+    likely_benign: usize,
+}
+
+fn variant_count(by_gene: &HashMap<String, Vec<&FinalRecord>>) -> usize {
+    by_gene.values().map(Vec::len).sum()
+}
+
 /// Write the summary section
 fn write_summary_section(
     md_file: &mut File,
-    category_counts: &HashMap<String, usize>,
+    counts: &SectionCounts,
     args: &Args,
     variants_reported: usize,
     variants_processed: usize,
@@ -1963,12 +1986,12 @@ fn write_summary_section(
     writeln!(md_file, "| Category | Count |")?;
     writeln!(md_file, "|---------|-------|")?;
     
-    let pathogenic_count = category_counts.get("pathogenic").unwrap_or(&0);
-    let likely_pathogenic_count = category_counts.get("likely_pathogenic").unwrap_or(&0);
-    let conflicting_count = category_counts.get("conflicting").unwrap_or(&0);
-    let vus_count = category_counts.get("vus").unwrap_or(&0);
-    let likely_benign_count = category_counts.get("likely_benign").unwrap_or(&0);
-    let benign_count = category_counts.get("benign").unwrap_or(&0);
+    let pathogenic_count = counts.pathogenic;
+    let likely_pathogenic_count = counts.likely_pathogenic;
+    let conflicting_count = counts.conflicting;
+    let vus_count = counts.vus;
+    let likely_benign_count = counts.likely_benign;
+    let benign_count = counts.benign;
     
     writeln!(md_file, "| Pathogenic | {} |", pathogenic_count)?;
     writeln!(md_file, "| Likely Pathogenic | {} |", likely_pathogenic_count)?;
@@ -2383,5 +2406,96 @@ mod tests {
             assert_eq!(ClinSigTerms::parse(clnsig).classify(), expected, "{clnsig}");
         }
         assert!(parse_clinvar_line(&clinvar_line("drug_response"), true, true).is_none());
+    }
+
+    fn final_record(pos: u32, gene: &str, classification: Classification) -> FinalRecord {
+        FinalRecord {
+            chr: "1".to_string(),
+            pos,
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+            clnsig: "Pathogenic".to_string(),
+            is_alt_pathogenic: classification.category() == "pathogenic",
+            gene: Some(gene.to_string()),
+            allele_id: None,
+            genotype: "0/1".to_string(),
+            review_stars: 1,
+            af_esp: None,
+            af_exac: None,
+            af_tgp: None,
+            clndn: None,
+            molecular_consequence: None,
+            functional_consequence: None,
+            mode_of_inheritance: None,
+            preferred_values: None,
+            citations: None,
+            comments: None,
+            family_data: None,
+            record_status: None,
+            description: None,
+            date_last_evaluated: None,
+            af_afr: None,
+            af_amr: None,
+            af_eas: None,
+            af_eur: None,
+            af_sas: None,
+            classification,
+        }
+    }
+
+    /// Writes a markdown report for `records` and returns its text.
+    fn markdown_report(records: &[FinalRecord], tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("pathogenic-test-{}-{tag}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let args = Args {
+            build: "GRCh38".to_string(),
+            input: dir.join("input.vcf"),
+            include_vus: true,
+            include_benign: true,
+            markdown_report: true,
+        };
+        let genes: HashSet<String> = records.iter().filter_map(|r| r.gene.clone()).collect();
+        let mut log = File::create(dir.join("test.log")).unwrap();
+        let path = dir.join("report.md");
+        generate_markdown_report(records, &path, &args, &genes, &args.input, "GRCH38", 99, "t", "pathogenic", &mut log).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        // Close the log first: on a network filesystem an open file keeps its directory non-empty.
+        drop(log);
+        fs::remove_dir_all(&dir).unwrap();
+        text
+    }
+
+    #[test]
+    fn summary_table_counts_the_records_each_section_lists() {
+        let classes = [
+            (Classification::Pathogenic, 2),
+            (Classification::LikelyPathogenic, 3),
+            (Classification::Uncertain, 1),
+            (Classification::Conflicting, 4),
+            (Classification::Benign, 2),
+            (Classification::LikelyBenign, 5),
+        ];
+        let mut records = Vec::new();
+        for (class, n) in classes {
+            for _ in 0..n {
+                let pos = 1000 + records.len() as u32;
+                records.push(final_record(pos, &format!("GENE{pos}"), class));
+            }
+        }
+        let text = markdown_report(&records, "summary");
+        for row in [
+            "| Pathogenic | 2 |",
+            "| Likely Pathogenic | 3 |",
+            "| Uncertain Significance | 1 |",
+            "| Conflicting | 4 |",
+            "| Benign | 2 |",
+            "| Likely Benign | 5 |",
+            "| **Total Variants Reported** | **17** |",
+        ] {
+            assert!(text.lines().any(|line| line == row), "missing summary row {row:?}");
+        }
+        // Each section lists its records once in its table and once in its details.
+        let detailed = text.lines().filter(|line| line.starts_with("<a id=\"variant-")).count();
+        assert_eq!(detailed, records.len());
     }
 }
