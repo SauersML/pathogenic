@@ -239,6 +239,44 @@ struct ClinVarRecord {
 /// Container for ClinVar variants keyed by (chr, pos, ref, alt)
 type ClinVarMap = HashMap<(String, u32, String, String), ClinVarRecord>;
 
+/// The germline classification terms present in one CLNSIG value
+///
+/// CLNSIG joins terms with `/` (the classifications of one record, e.g.
+/// `Pathogenic/Likely_pathogenic`) and `|` (further assertions such as
+/// `risk_factor`), and a `,_` suffix such as `,_low_penetrance` qualifies the
+/// term it follows. Matching whole terms, not substrings, is what lets each
+/// spelling below be stated once.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ClinSigTerms {
+    pathogenic: bool,
+    likely_pathogenic: bool,
+    uncertain: bool,
+    conflicting: bool,
+    likely_benign: bool,
+    benign: bool,
+}
+
+impl ClinSigTerms {
+    fn parse(clnsig: &str) -> ClinSigTerms {
+        let mut terms = ClinSigTerms::default();
+        for term in clnsig.split(['/', '|']) {
+            match term.split(",_").next().unwrap_or(term) {
+                "Pathogenic" => terms.pathogenic = true,
+                "Likely_pathogenic" => terms.likely_pathogenic = true,
+                // VUS-high, VUS-mid and VUS-low are ClinVar's sub-levels of uncertain significance.
+                "Uncertain_significance" | "VUS-high" | "VUS-mid" | "VUS-low" => terms.uncertain = true,
+                // ClinVar renamed this term in 2024; files from before and after the rename are in use.
+                "Conflicting_classifications_of_pathogenicity"
+                | "Conflicting_interpretations_of_pathogenicity" => terms.conflicting = true,
+                "Likely_benign" => terms.likely_benign = true,
+                "Benign" => terms.benign = true,
+                _ => {}
+            }
+        }
+        terms
+    }
+}
+
 /// Parse a single line from the ClinVar VCF
 fn parse_clinvar_line(line: &str, include_vus: bool, include_benign: bool) -> Option<Vec<ClinVarRecord>> {
     if line.starts_with('#') || line.trim().is_empty() {
@@ -275,10 +313,11 @@ fn parse_clinvar_line(line: &str, include_vus: bool, include_benign: bool) -> Op
     let clnsig_str = clnsig_opt.unwrap();
 
     // Filter variants based on clinical significance and command-line flags
-    let contains_pathogenic = clnsig_str.contains("Pathogenic") || clnsig_str.contains("Likely_pathogenic");
-    let contains_benign = clnsig_str.contains("Benign") || clnsig_str.contains("Likely_benign");
-    let contains_vus = clnsig_str.contains("Uncertain_significance");
-    let contains_conflicting = clnsig_str.contains("Conflicting_interpretations_of_pathogenicity");
+    let terms = ClinSigTerms::parse(clnsig_str);
+    let contains_pathogenic = terms.pathogenic || terms.likely_pathogenic;
+    let contains_benign = terms.benign || terms.likely_benign;
+    let contains_vus = terms.uncertain;
+    let contains_conflicting = terms.conflicting;
     
     // Determine the variant classification category
     let clnsig_category = if contains_pathogenic && !contains_benign {
@@ -2224,4 +2263,44 @@ fn write_understanding_section(md_file: &mut File) -> Result<(), Box<dyn Error>>
     writeln!(md_file, "- **Review Stars** indicate the level of review in ClinVar, with more stars representing more thorough evaluation.")?;
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clinvar_line(clnsig: &str) -> String {
+        format!("1\t1000\t1\tA\tG\t.\t.\tALLELEID=1;CLNSIG={clnsig};GENEINFO=GENE1:1")
+    }
+
+    #[test]
+    fn conflicting_is_read_under_both_clinvar_spellings() {
+        for spelling in [
+            "Conflicting_classifications_of_pathogenicity",
+            "Conflicting_interpretations_of_pathogenicity",
+        ] {
+            let records = parse_clinvar_line(&clinvar_line(spelling), true, false)
+                .unwrap_or_else(|| panic!("{spelling} dropped under --include-vus"));
+            assert_eq!(records[0].clnsig_category, "conflicting", "{spelling}");
+            assert!(parse_clinvar_line(&clinvar_line(spelling), false, false).is_none(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn vus_sub_levels_are_uncertain_significance() {
+        for clnsig in ["Uncertain_significance", "VUS-high", "VUS-mid", "VUS-low", "Uncertain_significance/VUS-high"] {
+            let records = parse_clinvar_line(&clinvar_line(clnsig), true, false)
+                .unwrap_or_else(|| panic!("{clnsig} dropped under --include-vus"));
+            assert_eq!(records[0].clnsig_category, "vus", "{clnsig}");
+        }
+    }
+
+    #[test]
+    fn clnsig_terms_are_whole_terms_with_modifiers_stripped() {
+        let terms = ClinSigTerms::parse("Pathogenic/Likely_pathogenic,_low_penetrance|risk_factor");
+        assert!(terms.pathogenic && terms.likely_pathogenic);
+        assert!(!terms.benign && !terms.likely_benign && !terms.uncertain && !terms.conflicting);
+        assert_eq!(ClinSigTerms::parse("drug_response|other"), ClinSigTerms::default());
+        assert_eq!(ClinSigTerms::parse("Uncertain_risk_allele"), ClinSigTerms::default());
+    }
 }
