@@ -190,7 +190,7 @@ Where `analysis_type` indicates which variant types were included in the report.
 
 2. **Variant Processing**:
    - Parses the user's VCF input
-   - Filters for variants present in the sample's genotype
+   - Filters for variants present in the sample's genotype (the GT of the first sample). A record with no call (no GT field, no sample column, or a missing call such as `./.`) is not evaluated: nothing says the sample carries its alleles. The number of such records is printed and written to the statistics file and the markdown summary
    - Matches variants against ClinVar based on selected variant types
    - Integrates 1000 Genomes allele frequency data
    - Adds detailed annotations from ClinVar summary data

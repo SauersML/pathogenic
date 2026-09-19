@@ -515,6 +515,13 @@ struct InputVariant {
     genotype: String,
 }
 
+impl InputVariant {
+    /// Whether the sample has a call here: a GT with at least one allele that is not "."
+    fn is_called(&self) -> bool {
+        parse_gt(&self.genotype).iter().any(Option::is_some)
+    }
+}
+
 /// The allele indices of a GT call such as "0/1", "1|1", "1/2" or a haploid "1",
 /// with `None` for a missing allele ("."). Phased and unphased calls parse alike:
 /// which alleles a call holds does not depend on its phase.
@@ -555,29 +562,15 @@ fn parse_input_line(line: &str) -> Option<(String, InputVariant)> {
     let alt_list: Vec<String> = alt_allele.split(',').map(|s| s.to_string()).collect();
     let mut present_flags = HashSet::new();
 
-    // Attempt to parse genotype from the next columns
-    // Usually the first of rest_cols is the FORMAT, second is the sample data
-    let genotype = if !rest_cols.is_empty() {
-        let format_str = rest_cols[0];
-        let format_items: Vec<&str> = format_str.split(':').collect();
-        if let Some(gt_index) = format_items.iter().position(|&f| f == "GT") {
-            if rest_cols.len() > 1 {
-                let sample_str = rest_cols[1];
-                let sample_items: Vec<&str> = sample_str.split(':').collect();
-                if gt_index < sample_items.len() {
-                    sample_items[gt_index].to_string()
-                } else {
-                    "1/1".to_string() 
-                }
-            } else {
-                "1/1".to_string()
-            }
-        } else {
-            "1/1".to_string()
-        }
-    } else {
-        "1/1".to_string()
-    };
+    // The first sample's GT (rest_cols holds FORMAT, then the samples). A record
+    // without a FORMAT GT or without a sample has no call, which is recorded as
+    // "." and says nothing about which alleles the sample carries.
+    let genotype = rest_cols
+        .first()
+        .and_then(|format| format.split(':').position(|key| key == "GT"))
+        .and_then(|gt_index| rest_cols.get(1)?.split(':').nth(gt_index))
+        .unwrap_or(".")
+        .to_string();
 
     for idx in parse_gt(&genotype).into_iter().flatten() {
         if idx >= 1 {
@@ -1111,6 +1104,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Parse the user VCF input
     let input_variants = parse_input_vcf(&input_path, &mut log_file)?;
+    // Records without a call are not evaluated: nothing says the sample carries their ALT alleles.
+    let uncalled_records = input_variants.iter().filter(|(_, iv)| !iv.is_called()).count();
+    if uncalled_records > 0 {
+        println!("[WARN] {uncalled_records} of {} input records have no genotype call and are not evaluated", input_variants.len());
+        writeln!(log_file, "[WARN] {uncalled_records} of {} input records have no genotype call and are not evaluated", input_variants.len())?;
+    }
 
     println!("[STEP] Matching user variants with ClinVar and 1000G...");
     writeln!(
@@ -1645,6 +1644,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     writeln!(stats_file, "\n=== Analysis Results ===")?;
     writeln!(stats_file, "Total Variants Processed: {}", input_variants.len())?;
+    writeln!(stats_file, "Records Without a Genotype Call (not evaluated): {}", uncalled_records)?;
     writeln!(stats_file, "Total Variants Reported: {}", final_records.len())?;
     writeln!(stats_file, "Unique Genes: {}", unique_genes.len())?;
     
@@ -1711,6 +1711,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &input_path,
             &build,
             input_variants.len(),
+            uncalled_records,
             &timestamp.to_string(),
             &command_run,
             &mut log_file,
@@ -1739,6 +1740,7 @@ fn generate_markdown_report(
     input_path: &Path,
     build: &str,
     total_variants: usize,
+    uncalled_records: usize,
     _timestamp: &str,
     command_run: &str,
     log_file: &mut File,
@@ -1971,7 +1973,7 @@ fn generate_markdown_report(
         if section.id == "disclaimer" {
             write_disclaimer_section(&mut md_file)?;
         } else if section.id == "summary" {
-            write_summary_section(&mut md_file, &section_counts, args, final_records.len(), total_variants, unique_genes.len())?;
+            write_summary_section(&mut md_file, &section_counts, args, final_records.len(), total_variants, uncalled_records, unique_genes.len())?;
         } else if section.id == "understanding-this-report" {
             write_understanding_section(&mut md_file)?;
         } else {
@@ -2019,6 +2021,7 @@ fn write_summary_section(
     args: &Args,
     variants_reported: usize,
     variants_processed: usize,
+    uncalled_records: usize,
     unique_genes_count: usize,
 ) -> Result<(), Box<dyn Error>> {
     writeln!(md_file, "<a id=\"summary\"></a>")?;
@@ -2030,6 +2033,8 @@ fn write_summary_section(
     // Additional summary stats
     writeln!(md_file)?;
     writeln!(md_file, "**Total Number of Genetic Variants Processed:** {}", variants_processed)?;
+    writeln!(md_file)?;
+    writeln!(md_file, "**Records Without a Genotype Call (not evaluated):** {}", uncalled_records)?;
     writeln!(md_file)?;
     writeln!(md_file, "**Number of Unique Genes with Identified Variants:** {}", unique_genes_count)?;
     writeln!(md_file)?;
@@ -2498,7 +2503,7 @@ mod tests {
         let genes: HashSet<String> = records.iter().filter_map(|r| r.gene.clone()).collect();
         let mut log = File::create(dir.join("test.log")).unwrap();
         let path = dir.join("report.md");
-        generate_markdown_report(records, &path, &args, &genes, &args.input, "GRCH38", 99, "t", "pathogenic", &mut log).unwrap();
+        generate_markdown_report(records, &path, &args, &genes, &args.input, "GRCH38", 99, 3, "t", "pathogenic", &mut log).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         // Close the log first: on a network filesystem an open file keeps its directory non-empty.
         drop(log);
@@ -2577,5 +2582,28 @@ mod tests {
         assert!(text.contains("| 0|1, Heterozygous |"), "{text}");
         assert!(text.contains("| 1|1, Homozygous |"), "{text}");
         assert!(!text.contains("Unknown |"), "{text}");
+    }
+
+    #[test]
+    fn a_record_without_a_genotype_call_carries_no_allele() {
+        for line in [
+            "1\t100\t.\tA\tG\t.\tPASS\t.",
+            "1\t100\t.\tA\tG\t.\tPASS\t.\tDP\t12",
+            "1\t100\t.\tA\tG\t.\tPASS\t.\tGT",
+            "1\t100\t.\tA\tG\t.\tPASS\t.\tGT:DP\t./.:3",
+        ] {
+            let (_, variant) = parse_input_line(line).unwrap();
+            assert!(!variant.is_called(), "{line}");
+            assert_eq!(variant.alts, vec![("G".to_string(), false)], "{line}");
+        }
+        let (_, hom_ref) = parse_input_line("1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/0").unwrap();
+        assert!(hom_ref.is_called());
+        assert_eq!(hom_ref.alts, vec![("G".to_string(), false)]);
+    }
+
+    #[test]
+    fn markdown_reports_how_many_records_had_no_call() {
+        let text = markdown_report(&[final_record(1000, "GENEA", Classification::Pathogenic)], "uncalled");
+        assert!(text.contains("**Records Without a Genotype Call (not evaluated):** 3"), "{text}");
     }
 }
