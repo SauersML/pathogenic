@@ -233,7 +233,7 @@ struct ClinVarRecord {
     af_esp: Option<f64>,
     af_exac: Option<f64>,
     af_tgp: Option<f64>,
-    clnsig_category: String, // "pathogenic", "benign", "vus", or "conflicting"
+    classification: Classification,
 }
 
 /// Container for ClinVar variants keyed by (chr, pos, ref, alt)
@@ -275,6 +275,74 @@ impl ClinSigTerms {
         }
         terms
     }
+
+    /// ClinVar's aggregate rule: classifications from more than one of the
+    /// pathogenic (P/LP), uncertain (VUS) and benign (B/LB) tiers conflict, so
+    /// such a record is Conflicting, never Pathogenic or Benign.
+    fn classify(self) -> Classification {
+        let pathogenic_tier = self.pathogenic || self.likely_pathogenic;
+        let benign_tier = self.benign || self.likely_benign;
+        let tiers = [pathogenic_tier, self.uncertain, benign_tier]
+            .into_iter()
+            .filter(|&present| present)
+            .count();
+        if self.conflicting || tiers > 1 {
+            Classification::Conflicting
+        } else if self.pathogenic {
+            Classification::Pathogenic
+        } else if self.likely_pathogenic {
+            Classification::LikelyPathogenic
+        } else if self.uncertain {
+            Classification::Uncertain
+        } else if self.benign {
+            Classification::Benign
+        } else if self.likely_benign {
+            Classification::LikelyBenign
+        } else {
+            Classification::Other
+        }
+    }
+}
+
+/// The report class of one ClinVar record
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Classification {
+    /// A Pathogenic term, alone or with Likely_pathogenic
+    Pathogenic,
+    /// Likely_pathogenic terms only
+    LikelyPathogenic,
+    Uncertain,
+    /// ClinVar's conflicting term, or terms from more than one tier
+    Conflicting,
+    /// A Benign term, alone or with Likely_benign
+    Benign,
+    /// Likely_benign terms only
+    LikelyBenign,
+    /// No germline classification term (drug_response, risk_factor, not_provided, ...)
+    Other,
+}
+
+impl Classification {
+    /// The CSV "Significance Category" value and the statistics file key
+    fn category(self) -> &'static str {
+        match self {
+            Classification::Pathogenic | Classification::LikelyPathogenic => "pathogenic",
+            Classification::Uncertain => "vus",
+            Classification::Conflicting => "conflicting",
+            Classification::Benign | Classification::LikelyBenign => "benign",
+            Classification::Other => "other",
+        }
+    }
+
+    /// Whether the command-line flags ask for records of this class
+    fn is_included(self, include_vus: bool, include_benign: bool) -> bool {
+        match self {
+            Classification::Pathogenic | Classification::LikelyPathogenic => true,
+            Classification::Uncertain | Classification::Conflicting => include_vus,
+            Classification::Benign | Classification::LikelyBenign => include_benign,
+            Classification::Other => false,
+        }
+    }
 }
 
 /// Parse a single line from the ClinVar VCF
@@ -313,35 +381,13 @@ fn parse_clinvar_line(line: &str, include_vus: bool, include_benign: bool) -> Op
     let clnsig_str = clnsig_opt.unwrap();
 
     // Filter variants based on clinical significance and command-line flags
-    let terms = ClinSigTerms::parse(clnsig_str);
-    let contains_pathogenic = terms.pathogenic || terms.likely_pathogenic;
-    let contains_benign = terms.benign || terms.likely_benign;
-    let contains_vus = terms.uncertain;
-    let contains_conflicting = terms.conflicting;
-    
-    // Determine the variant classification category
-    let clnsig_category = if contains_pathogenic && !contains_benign {
-        "pathogenic"
-    } else if contains_benign && !contains_pathogenic {
-        "benign"
-    } else if contains_vus {
-        "vus"
-    } else if contains_conflicting {
-        "conflicting"
-    } else {
-        "other"
-    };
-    
-    // Skip variants that don't match our inclusion criteria
-    if !((contains_pathogenic) || 
-         (include_vus && (contains_vus || contains_conflicting)) || 
-         (include_benign && contains_benign))
-    {
+    let classification = ClinSigTerms::parse(clnsig_str).classify();
+    if !classification.is_included(include_vus, include_benign) {
         return None;
     }
 
     // Determine if the variant is pathogenic for filtering in the match phase
-    let is_alt_pathogenic = contains_pathogenic && !(contains_benign);
+    let is_alt_pathogenic = classification.category() == "pathogenic";
 
     let gene_opt = info_map
         .get("GENEINFO")
@@ -369,7 +415,7 @@ fn parse_clinvar_line(line: &str, include_vus: bool, include_benign: bool) -> Op
             af_esp,
             af_exac,
             af_tgp,
-            clnsig_category: clnsig_category.to_string(),
+            classification,
         });
     }
     Some(recs)
@@ -838,7 +884,7 @@ struct FinalRecord {
     af_eas: Option<f64>,
     af_eur: Option<f64>,
     af_sas: Option<f64>,
-    clnsig_category: String,
+    classification: Classification,
 }
 
 /// Get the numeric order for sorting chromosomes
@@ -1039,7 +1085,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         af_exac: Option<f64>,
         af_tgp: Option<f64>,
         clndn: Option<String>,
-        clnsig_category: String,
+        classification: Classification,
     }
 
     // Match user variants with ClinVar
@@ -1083,7 +1129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         af_exac: cv.af_exac,
                         af_tgp: cv.af_tgp,
                         clndn: cv.clndn.clone(),
-                        clnsig_category: cv.clnsig_category.clone(),
+                        classification: cv.classification,
                     });
                 }
             }
@@ -1331,7 +1377,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             af_eas,
             af_eur,
             af_sas,
-            clnsig_category: r.clnsig_category.clone(),
+            classification: r.classification,
         };
         final_records.push(final_rec);
     }
@@ -1429,7 +1475,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &rec.alt_allele,
             &rec.clnsig,
             &rec.is_alt_pathogenic.to_string(),
-            &rec.clnsig_category,
+            rec.classification.category(),
             rec.gene.as_deref().unwrap_or(""),
             &rec.allele_id.map(|id| id.to_string()).unwrap_or_default(),
             rec.clndn.as_deref().unwrap_or(""),
@@ -1485,7 +1531,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         
         // Count by classification category
-        *category_counts.entry(rec.clnsig_category.clone()).or_insert(0) += 1;
+        *category_counts.entry(rec.classification.category().to_string()).or_insert(0) += 1;
         
         // Group by allele frequency range (for EAS, EUR, AFR, AMR, SAS)
         let add_af_range = |af: Option<f64>, population: &str, ranges: &mut HashMap<String, i32>| {
@@ -1677,7 +1723,7 @@ fn generate_markdown_report(
         let gene_name = record.gene.clone().unwrap_or_else(|| "Unknown".to_string());
         let clnsig = &record.clnsig;
         
-        if record.clnsig_category == "pathogenic" {
+        if record.classification.category() == "pathogenic" {
             // Split pathogenic variants based on their specific clnsig value
             if clnsig.contains("Likely_pathogenic") && !clnsig.contains("Pathogenic") {
                 has_likely_pathogenic = true;
@@ -1687,10 +1733,10 @@ fn generate_markdown_report(
                 has_pathogenic = true;
                 gene_pathogenic.entry(gene_name).or_default().push(record);
             }
-        } else if record.clnsig_category == "vus" && args.include_vus {
+        } else if record.classification.category() == "vus" && args.include_vus {
             has_vus = true;
             gene_vus.entry(gene_name).or_default().push(record);
-        } else if record.clnsig_category == "benign" && args.include_benign {
+        } else if record.classification.category() == "benign" && args.include_benign {
             // Split benign variants based on their specific clnsig value
             if clnsig.contains("Likely_benign") && !clnsig.contains("Benign") {
                 has_likely_benign = true;
@@ -1700,7 +1746,7 @@ fn generate_markdown_report(
                 has_benign = true;
                 gene_benign.entry(gene_name).or_default().push(record);
             }
-        } else if record.clnsig_category == "conflicting" && args.include_vus {
+        } else if record.classification.category() == "conflicting" && args.include_vus {
             has_conflicting = true;
             gene_conflicting.entry(gene_name).or_default().push(record);
         }
@@ -2281,7 +2327,7 @@ mod tests {
         ] {
             let records = parse_clinvar_line(&clinvar_line(spelling), true, false)
                 .unwrap_or_else(|| panic!("{spelling} dropped under --include-vus"));
-            assert_eq!(records[0].clnsig_category, "conflicting", "{spelling}");
+            assert_eq!(records[0].classification.category(), "conflicting", "{spelling}");
             assert!(parse_clinvar_line(&clinvar_line(spelling), false, false).is_none(), "{spelling}");
         }
     }
@@ -2291,7 +2337,7 @@ mod tests {
         for clnsig in ["Uncertain_significance", "VUS-high", "VUS-mid", "VUS-low", "Uncertain_significance/VUS-high"] {
             let records = parse_clinvar_line(&clinvar_line(clnsig), true, false)
                 .unwrap_or_else(|| panic!("{clnsig} dropped under --include-vus"));
-            assert_eq!(records[0].clnsig_category, "vus", "{clnsig}");
+            assert_eq!(records[0].classification.category(), "vus", "{clnsig}");
         }
     }
 
@@ -2302,5 +2348,40 @@ mod tests {
         assert!(!terms.benign && !terms.likely_benign && !terms.uncertain && !terms.conflicting);
         assert_eq!(ClinSigTerms::parse("drug_response|other"), ClinSigTerms::default());
         assert_eq!(ClinSigTerms::parse("Uncertain_risk_allele"), ClinSigTerms::default());
+    }
+
+    #[test]
+    fn terms_from_more_than_one_tier_are_conflicting_and_reported_only_as_conflicting() {
+        for clnsig in [
+            "Pathogenic/Benign",
+            "Likely_pathogenic|Likely_benign",
+            "Pathogenic/Uncertain_significance",
+            "Uncertain_significance/Likely_benign",
+            "Conflicting_classifications_of_pathogenicity|risk_factor",
+        ] {
+            assert_eq!(ClinSigTerms::parse(clnsig).classify(), Classification::Conflicting, "{clnsig}");
+            assert!(parse_clinvar_line(&clinvar_line(clnsig), false, true).is_none(), "{clnsig} reported without --include-vus");
+            let records = parse_clinvar_line(&clinvar_line(clnsig), true, false)
+                .unwrap_or_else(|| panic!("{clnsig} dropped under --include-vus"));
+            assert_eq!(records[0].classification.category(), "conflicting", "{clnsig}");
+            assert!(!records[0].is_alt_pathogenic, "{clnsig}");
+        }
+    }
+
+    #[test]
+    fn non_tier_terms_leave_the_tier_alone() {
+        let cases = [
+            ("Pathogenic|risk_factor", Classification::Pathogenic),
+            ("Pathogenic/Likely_pathogenic/Pathogenic,_low_penetrance|other", Classification::Pathogenic),
+            ("Likely_pathogenic/Likely_risk_allele", Classification::LikelyPathogenic),
+            ("Uncertain_significance/Uncertain_risk_allele", Classification::Uncertain),
+            ("Benign/Likely_benign|drug_response", Classification::Benign),
+            ("Likely_benign|association", Classification::LikelyBenign),
+            ("drug_response", Classification::Other),
+        ];
+        for (clnsig, expected) in cases {
+            assert_eq!(ClinSigTerms::parse(clnsig).classify(), expected, "{clnsig}");
+        }
+        assert!(parse_clinvar_line(&clinvar_line("drug_response"), true, true).is_none());
     }
 }

@@ -95,9 +95,19 @@ pathogenic -b GRCh38 -i your_variants.vcf --markdown-report=false
 
 - `--build`, `-b`: Genome build, must be either "GRCh37" (hg19) or "GRCh38" (hg38)
 - `--input`, `-i`: Path to the input VCF file (can be uncompressed or gzipped)
-- `--include-vus`, `-v`, `--vus`: Include variants of uncertain significance in the output
+- `--include-vus`, `-v`, `--vus`: Include variants of uncertain significance and variants with conflicting classifications in the output
 - `--include-benign`, `-n`, `--benign`: Include benign variants in the output
 - `--markdown-report`, `--md-report`: Generate markdown report (enabled by default, use `--markdown-report=false` to disable)
+
+### How a ClinVar record is classified
+
+The tool reads the terms of the record's `CLNSIG` field (separated by `/` and `|`; a suffix such as `,_low_penetrance` qualifies the term before it) and places each classification term in one of three tiers:
+
+- **pathogenic**: `Pathogenic`, `Likely_pathogenic`
+- **uncertain**: `Uncertain_significance` and its sub-levels `VUS-high`, `VUS-mid`, `VUS-low`
+- **benign**: `Benign`, `Likely_benign`
+
+A record is **conflicting** when ClinVar says so (`Conflicting_classifications_of_pathogenicity`, formerly `Conflicting_interpretations_of_pathogenicity`) or when its terms come from more than one tier, for example both a pathogenic and a benign term. That is ClinVar's own rule for its aggregate classification. A conflicting record is never counted as pathogenic or benign; it is reported with `--include-vus` in its own category. Terms outside the three tiers (`drug_response`, `risk_factor`, `association`, `not_provided`, risk-allele terms, ...) do not change a record's tier, and a record with none of the tier terms is not reported.
 
 ## Output
 
