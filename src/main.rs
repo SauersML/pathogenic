@@ -50,6 +50,14 @@ struct Args {
 enum DownloadError {
     Io(std::io::Error),
     Reqwest(reqwest::Error),
+    /// One byte range of a parallel download failed, so the file was not written
+    Chunk {
+        url: String,
+        index: usize,
+        start: u64,
+        end: u64,
+        reason: String,
+    },
 }
 
 impl fmt::Display for DownloadError {
@@ -57,6 +65,10 @@ impl fmt::Display for DownloadError {
         match self {
             DownloadError::Io(e) => write!(f, "IO error: {e}"),
             DownloadError::Reqwest(e) => write!(f, "Reqwest error: {e}"),
+            DownloadError::Chunk { url, index, start, end, reason } => write!(
+                f,
+                "download of {url} failed: chunk {index} (bytes {start}-{end}): {reason}"
+            ),
         }
     }
 }
@@ -89,7 +101,7 @@ fn download_file(
     writeln!(log_file, "  -> Starting download from {url}")?;
 
     let client = reqwest::blocking::Client::new();
-    let head_resp = client.head(url).send()?;
+    let head_resp = client.head(url).send()?.error_for_status()?;
     let total_size = head_resp
         .headers()
         .get(reqwest::header::CONTENT_LENGTH)
@@ -105,7 +117,7 @@ fn download_file(
     if total_size == 0 || accept_ranges != "bytes" {
         println!("  -> Server does not support parallel downloads; falling back to single-threaded download.");
         writeln!(log_file, "  -> Server does not support parallel downloads; falling back to single-threaded download.")?;
-        let mut response = client.get(url).send()?;
+        let mut response = client.get(url).send()?.error_for_status()?;
         let pb = ProgressBar::new(total_size);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -127,12 +139,13 @@ fn download_file(
         return Ok(());
     }
 
-    let num_chunks = num_cpus::get();
-    let chunk_size = total_size / num_chunks as u64;
+    // At most one chunk per byte, so that every range is non-empty.
+    let num_chunks = (num_cpus::get() as u64).clamp(1, total_size);
+    let chunk_size = total_size / num_chunks;
     let mut ranges = Vec::new();
     for i in 0..num_chunks {
-        let start = i as u64 * chunk_size;
-        let end = if i == num_chunks - 1 { total_size - 1 } else { (i as u64 + 1) * chunk_size - 1 };
+        let start = i * chunk_size;
+        let end = if i == num_chunks - 1 { total_size - 1 } else { (i + 1) * chunk_size - 1 };
         ranges.push((start, end));
     }
 
@@ -144,19 +157,40 @@ fn download_file(
         let url = url.to_string();
         let progress = Arc::clone(&progress);
         let handle = thread::spawn(move || -> Result<(usize, Vec<u8>), DownloadError> {
-            let range_header = format!("bytes={}-{}", start, end);
-            let mut resp = client.get(&url)
-                .header(reqwest::header::RANGE, range_header)
-                .send()?;
-            let mut buf = Vec::new();
-            let mut local_buf = [0u8; 8192];
-            loop {
-                let n = resp.read(&mut local_buf)?;
-                if n == 0 { break; }
-                buf.extend_from_slice(&local_buf[..n]);
-                progress.fetch_add(n as u64, Ordering::Relaxed);
-            }
-            Ok((i, buf))
+            let fetch = || -> Result<Vec<u8>, String> {
+                let range_header = format!("bytes={}-{}", start, end);
+                let mut resp = client.get(&url)
+                    .header(reqwest::header::RANGE, range_header)
+                    .send()
+                    .and_then(|resp| resp.error_for_status())
+                    .map_err(|e| e.to_string())?;
+                if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    return Err(format!(
+                        "server answered {} instead of 206 Partial Content",
+                        resp.status()
+                    ));
+                }
+                let mut buf = Vec::new();
+                let mut local_buf = [0u8; 8192];
+                loop {
+                    let n = resp.read(&mut local_buf).map_err(|e| e.to_string())?;
+                    if n == 0 { break; }
+                    buf.extend_from_slice(&local_buf[..n]);
+                    progress.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                let expected = end - start + 1;
+                if buf.len() as u64 != expected {
+                    return Err(format!("received {} of {expected} bytes", buf.len()));
+                }
+                Ok(buf)
+            };
+            fetch().map(|buf| (i, buf)).map_err(|reason| DownloadError::Chunk {
+                url: url.clone(),
+                index: i,
+                start,
+                end,
+                reason,
+            })
         });
         handles.push(handle);
     }
@@ -169,16 +203,20 @@ fn download_file(
             .progress_chars("=>-"),
     );
 
-    while progress.load(Ordering::Relaxed) < total_size {
+    // Wait for every chunk to finish, successfully or not. A failed chunk never
+    // delivers its bytes, so waiting for the byte count to reach the total
+    // would never end.
+    while !handles.iter().all(|handle| handle.is_finished()) {
         pb.set_position(progress.load(Ordering::Relaxed));
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    pb.finish_with_message("Download complete");
+    pb.set_position(progress.load(Ordering::Relaxed));
+    pb.finish();
 
     let mut chunks: Vec<(usize, Vec<u8>)> = Vec::with_capacity(handles.len());
     for handle in handles {
         let res = handle.join().map_err(|_| {
-            DownloadError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Thread join error"))
+            DownloadError::Io(std::io::Error::other("a download thread panicked"))
         })??;
         chunks.push(res);
     }
@@ -2605,5 +2643,112 @@ mod tests {
     fn markdown_reports_how_many_records_had_no_call() {
         let text = markdown_report(&[final_record(1000, "GENEA", Classification::Pathogenic)], "uncalled");
         assert!(text.contains("**Records Without a Genotype Call (not evaluated):** 3"), "{text}");
+    }
+
+    /// Serves `body` from 127.0.0.1 over HTTP/1.1 with range support. The range
+    /// ending at the last byte is answered with `last_range_status` instead of
+    /// 206, and with one byte short when `short_last_range` is set.
+    fn serve(body: Vec<u8>, last_range_status: u16, short_last_range: bool) -> String {
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let body = Arc::clone(&body);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    reader.read_line(&mut request_line).unwrap();
+                    let mut range = None;
+                    loop {
+                        let mut header = String::new();
+                        reader.read_line(&mut header).unwrap();
+                        let header = header.trim_end().to_ascii_lowercase();
+                        if header.is_empty() {
+                            break;
+                        }
+                        if let Some(value) = header.strip_prefix("range: bytes=") {
+                            let (start, end) = value.split_once('-').unwrap();
+                            range = Some((start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()));
+                        }
+                    }
+                    let last = body.len() - 1;
+                    let response = if request_line.starts_with("HEAD") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes()
+                    } else {
+                        let (start, end) = range.expect("a ranged GET");
+                        if end == last && last_range_status != 206 {
+                            format!(
+                                "HTTP/1.1 {last_range_status} Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .into_bytes()
+                        } else {
+                            let stop = if end == last && short_last_range { end } else { end + 1 };
+                            let chunk = &body[start..stop];
+                            let mut response = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                                chunk.len(),
+                                body.len()
+                            )
+                            .into_bytes();
+                            response.extend_from_slice(chunk);
+                            response
+                        }
+                    };
+                    stream.write_all(&response).unwrap();
+                });
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
+    fn download_body() -> Vec<u8> {
+        (0..10_007u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Downloads `url` into a fresh temporary file; returns the result and the file's bytes, if written.
+    fn download(url: &str, tag: &str) -> (Result<(), DownloadError>, Option<Vec<u8>>) {
+        let dir = std::env::temp_dir().join(format!("pathogenic-dl-{}-{tag}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("file");
+        let mut log = File::create(dir.join("download.log")).unwrap();
+        let result = download_file(url, &out, &mut log);
+        let written = fs::read(&out).ok();
+        // Close the log first: on a network filesystem an open file keeps its directory non-empty.
+        drop(log);
+        fs::remove_dir_all(&dir).unwrap();
+        (result, written)
+    }
+
+    #[test]
+    fn a_parallel_download_reassembles_its_chunks_in_order() {
+        let body = download_body();
+        let (result, written) = download(&serve(body.clone(), 206, false), "complete");
+        result.unwrap();
+        assert_eq!(written.as_deref(), Some(body.as_slice()));
+    }
+
+    #[test]
+    fn a_failed_chunk_fails_the_download_by_name() {
+        let (result, written) = download(&serve(download_body(), 500, false), "failed");
+        let message = result.expect_err("a failed chunk must fail the download").to_string();
+        assert!(message.contains("chunk") && message.contains("-10006):"), "{message}");
+        assert!(written.is_none(), "a failed download wrote the file");
+    }
+
+    #[test]
+    fn a_short_chunk_fails_the_download_by_name() {
+        let (result, written) = download(&serve(download_body(), 206, true), "short");
+        let message = result.expect_err("a short chunk must fail the download").to_string();
+        assert!(message.contains("-10006): received"), "{message}");
+        assert!(written.is_none(), "a failed download wrote the file");
     }
 }
